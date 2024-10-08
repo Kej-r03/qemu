@@ -46,9 +46,9 @@
 
 #define SIMBRICKS_CLOCK QEMU_CLOCK_VIRTUAL
 
-#define TYPE_PCI_SIMBRICKS_DEVICE "simbricks-pci"
+#define TYPE_PCI_SCX_DEVICE "scx-pci"
 #define SIMBRICKS_PCI(obj) \
-    OBJECT_CHECK(SimbricksPciState, obj, TYPE_PCI_SIMBRICKS_DEVICE)
+    OBJECT_CHECK(SimbricksPciState, obj, TYPE_PCI_SCX_DEVICE)
 
 typedef struct SimbricksPciBarInfo {
     struct SimbricksPciState *simbricks;
@@ -56,6 +56,8 @@ typedef struct SimbricksPciBarInfo {
     bool is_io;
     bool is_dummy;
 } SimbricksPciBarInfo;
+
+uint64_t* vts_mem_addr = NULL;
 
 typedef struct SimbricksPciRequest {
     CPUState *cpu;          /* CPU associated with this request */
@@ -92,13 +94,10 @@ typedef struct SimbricksPciState {
     size_t reqs_len;
     SimbricksPciRequest *reqs;
 
-    /* timers for synchronization etc. */
+    /*for synchronization etc. */
     bool sync;
     int sync_mode;
     int64_t ts_base;
-    QEMUTimer *timer_dummy;
-    QEMUTimer *timer_sync;
-    QEMUTimer *timer_poll;
 
     struct SimbricksPciState *next_simbricks;
 } SimbricksPciState;
@@ -122,15 +121,23 @@ static void panic(const char *msg, ...)
 }
 
 static inline uint64_t ts_to_proto(SimbricksPciState *simbricks,
-                                   int64_t qemu_ts)
+                                   int64_t scx_ts)
 {
-    return (qemu_ts - simbricks->ts_base) * 1000;
+    return (scx_ts + simbricks->ts_base) * 1000;
 }
 
 static inline int64_t ts_from_proto(SimbricksPciState *simbricks,
                                     uint64_t proto_ts)
 {
-    return (proto_ts / 1000) + simbricks->ts_base;
+    return (proto_ts / 1000) - simbricks->ts_base;
+}
+
+static inline uint64_t get_scx_ts(SimbricksPciState *simbricks) {
+    if(vts_mem_addr == NULL)
+        return 0;
+    uint64_t scx_vts = 0;
+    pci_dma_read(&simbricks->pdev, vts_mem_addr + 100, (void *)&scx_vts, 8);
+    return scx_vts;
 }
 
 static inline volatile union SimbricksProtoPcieH2D *simbricks_comm_h2d_alloc(
@@ -245,19 +252,7 @@ static void simbricks_comm_d2h_rcomp(SimbricksPciState *simbricks,
 
     req->processing = false;
 
-    if (simbricks->sync) {
-        cpu = req->cpu;
-
-#ifdef DEBUG_PRINTS
-        warn_report("simbricks_comm_d2h_rcomp: kicking cpu %lu ts=%lu",
-                req_id, cur_ts);
-#endif
-
-        cpu->stopped = 0;
-        //qemu_cpu_kick(cpu);
-    } else {
-        qemu_cond_broadcast(&req->cond);
-    }
+    qemu_cond_broadcast(&req->cond);
 }
 
 /* process and complete message */
@@ -266,7 +261,7 @@ static void simbricks_comm_d2h_process(
         int64_t ts,
         volatile union SimbricksProtoPcieD2H *msg)
 {
-    printf("simbricks_comm_d2h_process\n");
+    // printf("simbricks_comm_d2h_process\n");
     uint8_t type;
 
     type = SimbricksPcieIfD2HInType(&simbricks->pcieif, msg);
@@ -307,10 +302,6 @@ static void simbricks_comm_d2h_process(
     SimbricksPcieIfD2HInDone(&simbricks->pcieif, msg);
 }
 
-static void simbricks_timer_dummy(void *data)
-{
-}
-
 static void simbricks_timer_poll(void *data)
 {
     SimbricksPciState *simbricks = data;
@@ -318,7 +309,8 @@ static void simbricks_timer_poll(void *data)
     volatile union SimbricksProtoPcieD2H *next_msg;
     int64_t cur_ts, next_ts, proto_ts;
 
-    cur_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
+
+    cur_ts = get_scx_ts(simbricks);
     proto_ts = ts_to_proto(simbricks, cur_ts + 1); // + 1 to avoid getting stuck
                                                    // on off by ones due to of
                                                    // rounding
@@ -342,18 +334,22 @@ static void simbricks_timer_poll(void *data)
         next_msg = SimbricksPcieIfD2HInPeek(&simbricks->pcieif, proto_ts);
         next_ts = SimbricksPcieIfD2HInTimestamp(&simbricks->pcieif);
     } while (!next_msg && next_ts <= proto_ts);
-    // printf("Inside timer poll\n");
-    // printf("curr_ts: %ld, next_ts: %ld\n", cur_ts, next_ts);
+
     /* set timer for next message */
     /* we need to do this before actually processing the message, in order to
      * have a timer set to prevent the clock from running away from us. We set a
      * dummy timer with the current ts to prevent the clock from jumping */
-    timer_mod_ns(simbricks->timer_dummy, cur_ts);
-    timer_mod_ns(simbricks->timer_poll, ts_from_proto(simbricks, next_ts));
+
+    if(vts_mem_addr) {
+        next_ts = ts_from_proto(&simbricks, next_ts);
+        // printf("Inside timer poll\n");
+        // printf("curr_ts: %ld, next_ts: %ld\n", cur_ts, next_ts);
+        pci_dma_write(&simbricks->pdev, vts_mem_addr, (void *)&next_ts, 8);
+    }
     if (simbricks->sync_ts_bumped) {
-        timer_mod_ns(simbricks->timer_sync,
-            ts_from_proto(simbricks,
-                SimbricksBaseIfOutNextSync(&simbricks->pcieif.base)));
+        uint64_t next_sync_ts = SimbricksBaseIfOutNextSync(&simbricks->pcieif.base);
+        next_sync_ts = ts_from_proto(simbricks, next_sync_ts);
+        pci_dma_write(&simbricks->pdev, vts_mem_addr + 50, (void *)&next_sync_ts, 8);
         simbricks->sync_ts_bumped = false;
     }
 
@@ -376,7 +372,7 @@ static void simbricks_timer_sync(void *data)
     int64_t cur_ts;
     uint64_t proto_ts;
 
-    cur_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
+    cur_ts = get_scx_ts(simbricks);
     proto_ts = ts_to_proto(simbricks, cur_ts);
 
 #ifdef DEBUG_PRINTS
@@ -405,15 +401,13 @@ static void simbricks_timer_sync(void *data)
     warn_report("simbricks_timer_sync: next pts=%lu ts=%lu", next_sync_pts,
         next_sync_ts);
 #endif
-    timer_mod_ns(simbricks->timer_sync, next_sync_ts);
+    pci_dma_write(&simbricks->pdev, vts_mem_addr + 50, (void *)&next_sync_ts, 8);
 }
 
 static void *simbricks_poll_thread(void *opaque)
 {
     SimbricksPciState *simbricks = opaque;
     volatile union SimbricksProtoPcieD2H *msg;
-
-    assert(!simbricks->sync);
 
     while (!simbricks->stopping) {
         msg = SimbricksPcieIfD2HInPoll(&simbricks->pcieif, 0);
@@ -454,24 +448,7 @@ static void simbricks_mmio_rw(SimbricksPciState *simbricks,
     req = simbricks->reqs + cpu->cpu_index;
     assert(req->cpu == cpu);
 
-    cur_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
-
-// jiacma
-    // if(addr == 1000){
-    //     void* scx_mem_addr = (uint64_t*)*val;
-    //     warn_report("simbricks_mmio_scx_data: mmio offset %ld, addr %p\n", addr, scx_mem_addr);
-    //     // warn_report(“simbricks_mmio_scx_data: mmio offset %ld, data of scx %lu”, addr, *scx_mem_addr);
-    //     uint64_t data = 0x12345678;
-    //     // uint64_t* data = malloc(8);
-    //     // *data = 0x12345678;
-    //     uint64_t databack = 0;
-    //     pci_dma_read(&simbricks->pdev, scx_mem_addr, (void *)&databack, 8);
-    //     warn_report("simbricks_mmio_scx_data: after dma read %lu", databack);
-    //     warn_report("simbricks_mmio_scx_data: before dma write");
-    //     pci_dma_write(&simbricks->pdev, scx_mem_addr, (void *)&data, 8);
-    //     warn_report("simbricks_mmio_scx_data: after dma write");
-    //     return;
-    // }
+    cur_ts = get_scx_ts(simbricks);
 
     if (req->requested) {
         /* a request from this CPU has been started */
@@ -480,8 +457,9 @@ static void simbricks_mmio_rw(SimbricksPciState *simbricks,
 
         if (req->processing) {
             /* request in progress, we have to wait */
-            cpu->stopped = 1;
-            cpu_loop_exit(cpu);
+            printf("CPU stopped\n");
+            while (req->processing)
+                qemu_cond_wait_iothread(&req->cond);
         } else if (req->addr == addr && req->bar == bar && req->size == size) {
             /* request finished */
 #ifdef DEBUG_PRINTS
@@ -511,7 +489,7 @@ static void simbricks_mmio_rw(SimbricksPciState *simbricks,
         write->offset = addr;
         write->len = size;
         write->bar = bar;
-        printf("IS write: reqid: %d, offset: %d, len: %d, bar: %d\n", write->req_id, write->offset, write->len, write->bar);
+        printf("is_write: req_id: %d, offset: %d, len: %d, bar: %d\n", write->req_id, write->offset, write->len, write->bar);
 
         assert(size <=
             SimbricksPcieIfH2DOutMsgLen(&simbricks->pcieif) - sizeof (*write));
@@ -548,23 +526,18 @@ static void simbricks_mmio_rw(SimbricksPciState *simbricks,
         req->bar = bar;
         req->size = size;
 
+        printf("is_read: req_id: %d, offset: %d, len: %d, bar: %d, processing: %d, requested: %d\n", write->req_id, write->offset, write->len, write->bar, req->processing, req->requested);
 
-        printf("IS read: reqid: %d, offset: %d, len: %d, bar: %d, processing: %d, requested: %d\n", write->req_id, write->offset, write->len, write->bar, req->processing, req->requested);
 #ifdef DEBUG_PRINTS
         warn_report("simbricks_mmio_rw: starting wait for read (%lu) addr=%lx "
                     "size=%x", cur_ts, addr, size);
 #endif
 
-        if (simbricks->sync) {
-            cpu->stopped = 1;
-            cpu_loop_exit(cpu);
-        } else {
-            while (req->processing)
-                qemu_cond_wait_iothread(&req->cond);
+        while (req->processing)
+            qemu_cond_wait_iothread(&req->cond);
 
-            *val = req->value;
-            req->requested = false;
-        }
+        *val = req->value;
+        req->requested = false;
     }
 }
 
@@ -586,14 +559,50 @@ static uint64_t simbricks_mmio_read(void *opaque, hwaddr addr, unsigned size)
 static void simbricks_mmio_write(void *opaque, hwaddr addr, uint64_t val,
                 unsigned size)
 {
-    printf("MMIO write at addrs: %ld, val: %ld\n", addr, val);
+    // printf("MMIO write at addrs: %ld, val: %ld\n", addr, val);
     SimbricksPciBarInfo *bar = opaque;
     SimbricksPciState *simbricks = bar->simbricks;
 
     if (bar->is_dummy)
         return;
+    if(addr == 1000){
+        vts_mem_addr = (uint64_t*)val;
+        warn_report("simbricks_mmio_scx_data: mmio offset %ld, addr %p\n", addr, vts_mem_addr);
 
-    simbricks_mmio_rw(simbricks, bar->index, addr, size, &val, true);
+        uint64_t first_sync_ts = 0, first_msg_ts = 0;
+        volatile union SimbricksProtoPcieD2H *msg;
+        if(simbricks->sync) {
+            /* send a first sync */
+            if (SimbricksPcieIfH2DOutSync(&simbricks->pcieif, 0)) {
+                // error_setg(errp, "sending initial sync failed");
+                return 0;
+            }
+            first_sync_ts = SimbricksPcieIfH2DOutNextSync(&simbricks->pcieif);
+
+            /* wait for first message so we know its timestamp */
+            do {
+                msg = SimbricksPcieIfD2HInPeek(&simbricks->pcieif, 0);
+                first_msg_ts = SimbricksPcieIfD2HInTimestamp(&simbricks->pcieif);
+            } while (!msg && !first_msg_ts);
+            
+            first_msg_ts/=1000;
+            first_sync_ts/=1000;
+            simbricks->ts_base = SimbricksPcieIfD2HInTimestamp(&simbricks->pcieif)/1000;
+            printf("ts_base: %ld, first_msg_ts: %ld, first_sync_ts: %ld\n", simbricks->ts_base, first_msg_ts, first_sync_ts);
+
+            pci_dma_write(&simbricks->pdev, vts_mem_addr + 50, (void *)&first_sync_ts, 8);
+            pci_dma_write(&simbricks->pdev, vts_mem_addr, (void *)&first_msg_ts, 8);
+        }
+    } 
+    else if (addr == 1200) {
+        simbricks_timer_poll(simbricks);
+    }
+    else if(addr==800) {
+        simbricks_timer_sync(simbricks);
+    }
+    else {
+        simbricks_mmio_rw(simbricks, bar->index, addr, size, &val, true);
+    }
 }
 
 static const MemoryRegionOps simbricks_mmio_ops = {
@@ -634,7 +643,7 @@ static void simbricks_config_write(PCIDevice *dev,
             msix_before != msix_after)
     {
         msg = simbricks_comm_h2d_alloc(simbricks,
-                                       qemu_clock_get_ns(SIMBRICKS_CLOCK));
+                                       get_scx_ts(simbricks));
         devctrl = &msg->devctrl;
 
         devctrl->flags = 0;
@@ -714,20 +723,6 @@ static int simbricks_connect(SimbricksPciState *simbricks, Error **errp)
         return 0;
     }
 
-    if (simbricks->sync) {
-        /* send a first sync */
-        if (SimbricksPcieIfH2DOutSync(&simbricks->pcieif, 0)) {
-            error_setg(errp, "sending initial sync failed");
-            return 0;
-        }
-        first_sync_ts = SimbricksPcieIfH2DOutNextSync(&simbricks->pcieif);
-
-        /* wait for first message so we know its timestamp */
-        do {
-            msg = SimbricksPcieIfD2HInPeek(&simbricks->pcieif, 0);
-            first_msg_ts = SimbricksPcieIfD2HInTimestamp(&simbricks->pcieif);
-        } while (!msg && !first_msg_ts);
-    }
     simbricks->reqs_len = 0;
     CPU_FOREACH(cpu) {
         simbricks->reqs_len++;
@@ -738,25 +733,8 @@ static int simbricks_connect(SimbricksPciState *simbricks, Error **errp)
         qemu_cond_init(&simbricks->reqs[cpu->cpu_index].cond);
     }
 
-    if (simbricks->sync) {
-        simbricks->timer_dummy =
-            timer_new_ns(SIMBRICKS_CLOCK, simbricks_timer_dummy, simbricks);
-
-        simbricks->ts_base = qemu_clock_get_ns(SIMBRICKS_CLOCK);
-        printf("Ts_base: %ld, first_msg_ts: %ld\n", simbricks->ts_base, first_msg_ts);
-        simbricks->timer_sync =
-            timer_new_ns(SIMBRICKS_CLOCK, simbricks_timer_sync, simbricks);
-        timer_mod_ns(simbricks->timer_sync,
-            ts_from_proto(simbricks, first_sync_ts));
-        simbricks->timer_poll =
-            timer_new_ns(SIMBRICKS_CLOCK, simbricks_timer_poll, simbricks);
-        timer_mod_ns(simbricks->timer_poll,
-            ts_from_proto(simbricks, first_msg_ts));
-    } else {
-        printf("simbricks thread poll create\n");
-        qemu_thread_create(&simbricks->thread, "simbricks-poll",
-                simbricks_poll_thread, simbricks, QEMU_THREAD_JOINABLE);
-    }
+    qemu_thread_create(&simbricks->thread, "simbricks-poll",
+            simbricks_poll_thread, simbricks, QEMU_THREAD_JOINABLE);
 
     /* set vendor, device, revision, and class id */
     pci_config_set_vendor_id(pci_conf, d_i->pci_vendor_id);
@@ -865,24 +843,13 @@ static void pci_simbricks_uninit(PCIDevice *pdev)
     SimbricksPciState *simbricks = SIMBRICKS_PCI(pdev);
     CPUState *cpu;
 
-    if (!simbricks->sync) {
-        simbricks->stopping = true;
-        qemu_thread_join(&simbricks->thread);
-    }
+    simbricks->stopping = true;
+    qemu_thread_join(&simbricks->thread);
 
     CPU_FOREACH(cpu) {
         qemu_cond_destroy(&simbricks->reqs[cpu->cpu_index].cond);
     }
     free(simbricks->reqs);
-
-    if (simbricks->sync) {
-        timer_del(simbricks->timer_dummy);
-        timer_free(simbricks->timer_dummy);
-        timer_del(simbricks->timer_sync);
-        timer_free(simbricks->timer_sync);
-        timer_del(simbricks->timer_poll);
-        timer_free(simbricks->timer_poll);
-    }
 
     if (simbricks->dev_intro.pci_msi_nvecs > 0)
         msi_uninit(pdev);
@@ -932,7 +899,7 @@ static void pci_simbricks_register_types(void)
         { },
     };
     static const TypeInfo simbricks_info = {
-        .name          = TYPE_PCI_SIMBRICKS_DEVICE,
+        .name          = TYPE_PCI_SCX_DEVICE,
         .parent        = TYPE_PCI_DEVICE,
         .instance_size = sizeof(SimbricksPciState),
         .instance_init = simbricks_pci_instance_init,
@@ -944,7 +911,7 @@ static void pci_simbricks_register_types(void)
 }
 type_init(pci_simbricks_register_types)
 
-void simbricks_cleanup(void)
+void scx_cleanup(void)
 {
     SimbricksPciState *sbs;
     for (sbs = simbricks_all; sbs != NULL; sbs = sbs->next_simbricks)
